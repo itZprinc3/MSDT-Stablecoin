@@ -52,6 +52,9 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__TransferFailed();
     error DSCEngine__HealthFactorISBroken(uint256 healthFactor);
     error DSCEngine__MintFailed();
+    error DSCEngine__HealthFactorISFine();
+    error DSCEngine__HealthFactorNotImproved();
+    error DSCEngine_HealthFactorImproved();
 
     //State Variables
     mapping(address token => address pricefeed) private s_priceFeed; //token to its pricefeed address
@@ -60,11 +63,12 @@ contract DSCEngine is ReentrancyGuard {
     mapping(address user => uint256 amountMSDT) private s_MSDTMinted; //mapping of user to the amount of msdt minted by him
     address[] private s_collateralTokens; //array of collateral tokens
 
-    uint256 private constant ADDITONAL_FEED_PRECISION = 1e10;
+    uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
     uint256 private constant PRECISION = 1e18;
     uint256 private constant MIN_HEALTH_FACTOR = 1e18;
     uint256 private constant LIQUIDATION_THRESHOLD = 50;
     uint256 private constant LIQUIDATION_PRECISION = 100; // together there represent
+    uint256 private constant LIQUIDATION_BONUS = 10;
 
     DecentralizedStableCoin private immutable i_msdt;
 
@@ -73,6 +77,13 @@ contract DSCEngine is ReentrancyGuard {
         address indexed user,
         address indexed collateralTokenAddress,
         uint256 indexed amountDeposited
+    );
+
+    event CollateralRedeemed(
+        address indexed redeemedFrom,
+        address indexed redeemedTo,
+        address indexed token,
+        uint256 amount
     );
 
     //Modifiers
@@ -113,18 +124,32 @@ contract DSCEngine is ReentrancyGuard {
     }
 
     //External Functions
-    function depositColleteralAndMintMSDT() external {}
+
+    /**
+     * @param tokenCollateralAddress The address of token to deposit as collateral
+     * @param amountCollateral The amount of collateral to deposit
+     * @param amountMsdtToMint  The amount of Stablecoin to Mint
+     * @notice this function will deposit your collateral and mint MSDT in one transaction
+     */
+    function depositColleteralAndMintMSDT(
+        address tokenCollateralAddress,
+        uint256 amountCollateral,
+        uint256 amountMsdtToMint
+    ) external {
+        depositCollateral(tokenCollateralAddress, amountCollateral);
+        mintMSDT(amountMsdtToMint);
+    }
 
     /**
      * @notice follows CEI: Check, Effect, Interaction
      * @param tokenCollateralAddress The address of token to be deposit as Colleteral
      * @param amountCollateral The amount of Collateral to deposit
      */
-    function depositColleteral(
+    function depositCollateral(
         address tokenCollateralAddress,
         uint256 amountCollateral
     )
-        external
+        public
         moreThanZero(amountCollateral)
         isAllowedToken(tokenCollateralAddress)
         nonReentrant
@@ -141,15 +166,36 @@ contract DSCEngine is ReentrancyGuard {
             msg.sender,
             address(this),
             amountCollateral
-        );
+        ); //msg.sender is the user who is depositing the collateral, while address(this) is address of this contract
         if (!success) {
             revert DSCEngine__TransferFailed();
         }
     }
 
-    function redeemColleteralForMSDT() external {}
+    function redeemColleteralForMSDT(
+        address tokenCollateralAddress,
+        uint256 amountCollateral,
+        uint256 amountMsdtToBurn
+    ) external {
+        burnMSDT(amountMsdtToBurn);
+        redeemColleteral(tokenCollateralAddress, amountCollateral);
+    }
 
-    function redeemColleteral() external {}
+    //health factor should be over 1 after collateral is pulled
+    //must follow check efferct interact
+
+    function redeemColleteral(
+        address tokenCollateralAddress,
+        uint256 amountCollateral
+    ) public moreThanZero(amountCollateral) nonReentrant {
+        _redeemCollateral(
+            msg.sender,
+            msg.sender,
+            tokenCollateralAddress,
+            amountCollateral
+        );
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
     /**
      * @notice follows CEI: Check, Effect, Interaction
@@ -157,7 +203,7 @@ contract DSCEngine is ReentrancyGuard {
      */
     function mintMSDT(
         uint256 amountMSDTToMint
-    ) external moreThanZero(amountMSDTToMint) nonReentrant {
+    ) public moreThanZero(amountMSDTToMint) nonReentrant {
         //moreThankZero: Check
         s_MSDTMinted[msg.sender] += amountMSDTToMint; //Effect
         _revertIfHealthFactorIsBroken(msg.sender);
@@ -167,13 +213,99 @@ contract DSCEngine is ReentrancyGuard {
         }
     }
 
-    function burnMSDT() external {}
+    function burnMSDT(uint256 amount) public moreThanZero(amount) {
+        _burnMsdt(amount, msg.sender, msg.sender);
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
-    function liquidate() external {}
+    function liquidate(
+        address collateral,
+        address user,
+        uint256 debtToCover
+    ) external moreThanZero(debtToCover) nonReentrant {
+        uint256 startingUserHealthFactor = _healthFactor(user);
+        if (startingUserHealthFactor >= MIN_HEALTH_FACTOR) {
+            revert DSCEngine__HealthFactorISFine();
+        }
+
+        //burn msdt debt
+        uint256 tokenAmountFromDebtCovered = getTokenAmountFromUsd(
+            collateral,
+            debtToCover
+        );
+        //10% bonus for liquidetor
+        uint256 bonusCollateral = (tokenAmountFromDebtCovered *
+            LIQUIDATION_BONUS) / LIQUIDATION_PRECISION;
+
+        uint256 totalCollateralToRedeem = tokenAmountFromDebtCovered +
+            bonusCollateral;
+        _redeemCollateral(
+            user,
+            msg.sender,
+            collateral,
+            totalCollateralToRedeem
+        );
+        _burnMsdt(debtToCover, user, msg.sender);
+        uint256 endingUserHealthFactor = _healthFactor(user);
+        if (endingUserHealthFactor <= startingUserHealthFactor) {
+            revert DSCEngine__HealthFactorNotImproved();
+        }
+        revert DSCEngine_HealthFactorImproved();
+    }
 
     function getHealthFunction() external view {}
 
     // Private and Internal View+++++++++++ Functions
+
+    function _getAccountInfo(
+        address user
+    )
+        private
+        view
+        returns (uint256 totalMSDTMinted, uint256 collateralValueInUsd)
+    {
+        totalMSDTMinted = s_MSDTMinted[user];
+        collateralValueInUsd = _getAccountCollateralValue(user);
+    }
+
+    function _burnMsdt(
+        uint256 amountMsdtToBurn,
+        address onBehalfOf,
+        address dscFrom
+    ) public {
+        s_MSDTMinted[onBehalfOf] -= amountMsdtToBurn;
+        bool success = i_msdt.transferFrom(
+            dscFrom,
+            address(this),
+            amountMsdtToBurn
+        );
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+        i_msdt.burn(amountMsdtToBurn);
+    }
+
+    function _redeemCollateral(
+        address from,
+        address to,
+        address tokenCollateralAddress,
+        uint256 amountCollateral
+    ) public moreThanZero(amountCollateral) {
+        s_collateralDeposited[from][tokenCollateralAddress] -= amountCollateral;
+        emit CollateralRedeemed(
+            from,
+            to,
+            tokenCollateralAddress,
+            amountCollateral
+        );
+        bool success = IERC20(tokenCollateralAddress).transfer(
+            to,
+            amountCollateral
+        );
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+    }
 
     function _revertIfHealthFactorIsBroken(address user) internal view {
         //1) Check health factor, it tells if someone has enough collateral to back the msdt they have minted
@@ -213,14 +345,20 @@ contract DSCEngine is ReentrancyGuard {
         return (collateralAdjustedForThershold * PRECISION) / totalMSDTMinted;
     }
 
-    function _getAccountInfo(
-        address user
-    ) private returns (uint256 totalMSDTMinted, uint256 collateralValueInUsd) {
-        totalMSDTMinted = s_MSDTMinted[user];
-        collateralValueInUsd = _getAccountCollateralValue(user);
-    }
-
     //Public And External Functions
+
+    function getTokenAmountFromUsd(
+        address token,
+        uint256 usdAmountInWei
+    ) public view returns (uint256) {
+        AggregatorV3Interface pricefeed = AggregatorV3Interface(
+            s_priceFeed[token]
+        );
+        (, int256 price, , , ) = pricefeed.latestRoundData();
+        return
+            (usdAmountInWei * PRECISION) /
+            (uint256(price) * ADDITIONAL_FEED_PRECISION);
+    }
 
     function _getAccountCollateralValue(
         address user
@@ -244,6 +382,6 @@ contract DSCEngine is ReentrancyGuard {
         (, int256 price, , , ) = pricefeed.latestRoundData();
 
         return
-            ((uint256(price) * ADDITONAL_FEED_PRECISION) * amount) / PRECISION;
+            ((uint256(price) * ADDITIONAL_FEED_PRECISION) * amount) / PRECISION;
     }
 }
